@@ -1,0 +1,85 @@
+{
+  "name": "Agent Task Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "agent-task",
+        "responseMode": "responseNode"
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://api:8000/api/v1/tasks",
+        "method": "POST",
+        "body": {
+          "input": "={{ $json.input }}",
+          "session_id": "={{ $json.session_id }}",
+          "user_id": "={{ $json.user_id }}"
+        }
+      },
+      "name": "Submit to Orchestrator",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.escalated }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "Check Escalation",
+      "type": "n8n-nodes-base.if",
+      "position": [750, 300]
+    },
+    {
+      "parameters": {
+        "channel": "#agent-escalations",
+        "text": "🚨 Agent escalation required\nSession: {{ $json.session_id }}\nBlocked by: {{ $json.blocked_by }}\nResponse preview: {{ $json.response.substring(0, 200) }}"
+      },
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.slack",
+      "position": [1000, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1000, 400]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{"node": "Submit to Orchestrator", "type": "main", "index": 0}]
+      ]
+    },
+    "Submit to Orchestrator": {
+      "main": [
+        [{"node": "Check Escalation", "type": "main", "index": 0}]
+      ]
+    },
+    "Check Escalation": {
+      "main": [
+        [{"node": "Slack Alert", "type": "main", "index": 0}],
+        [{"node": "Respond", "type": "main", "index": 0}]
+      ]
+    },
+    "Slack Alert": {
+      "main": [
+        [{"node": "Respond", "type": "main", "index": 0}]
+      ]
+    }
+  }
+}

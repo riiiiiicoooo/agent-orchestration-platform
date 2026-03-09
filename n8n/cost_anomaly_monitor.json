@@ -1,0 +1,78 @@
+{
+  "name": "Cost Anomaly Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{"field": "hours", "hoursInterval": 1}]
+        }
+      },
+      "name": "Hourly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://api:8000/api/v1/cost/summary",
+        "method": "GET"
+      },
+      "name": "Get Cost Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://api:8000/api/v1/agents/status",
+        "method": "GET"
+      },
+      "name": "Get Agent Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 500]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.total_cost }}",
+              "operation": "largerThan",
+              "value2": 100
+            }
+          ]
+        }
+      },
+      "name": "Cost Spike Check",
+      "type": "n8n-nodes-base.if",
+      "position": [750, 300]
+    },
+    {
+      "parameters": {
+        "channel": "#agent-costs",
+        "text": "💰 Cost Alert: Total spend ${{ $json.total_cost.toFixed(2) }} exceeds threshold\n\nBy model:\n{{ Object.entries($json.by_model).map(([k,v]) => `  ${k}: $${v.toFixed(2)}`).join('\\n') }}\n\nBy provider:\n{{ Object.entries($json.by_provider).map(([k,v]) => `  ${k}: $${v.toFixed(2)}`).join('\\n') }}"
+      },
+      "name": "Cost Alert",
+      "type": "n8n-nodes-base.slack",
+      "position": [1000, 200]
+    }
+  ],
+  "connections": {
+    "Hourly Trigger": {
+      "main": [
+        [
+          {"node": "Get Cost Summary", "type": "main", "index": 0},
+          {"node": "Get Agent Status", "type": "main", "index": 0}
+        ]
+      ]
+    },
+    "Get Cost Summary": {
+      "main": [
+        [{"node": "Cost Spike Check", "type": "main", "index": 0}]
+      ]
+    },
+    "Cost Spike Check": {
+      "main": [
+        [{"node": "Cost Alert", "type": "main", "index": 0}]
+      ]
+    }
+  }
+}
