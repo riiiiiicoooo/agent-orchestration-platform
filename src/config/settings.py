@@ -18,7 +18,7 @@ class Settings:
     # Database
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/agent_orchestration",
+        "postgresql://localhost:5432/agent_orchestration",
     )
 
     # Redis
