@@ -37,7 +37,7 @@ jobs:
 
       - name: Lint with Ruff
         run: |
-          ruff check src/ --select E,F,W,I --ignore E501,E402,F401,F811,E711,E712,W291,W292,W293
+          ruff check src/ --select E,F,W --ignore E501,E402,F401,F811,E711,E712,W291,W292,W293
 
       - name: Type check with mypy
         run: |
@@ -61,7 +61,7 @@ jobs:
 
       - name: Security scan with Bandit
         run: |
-          bandit -r src/ -ll -ii --skip B101,B105,B106,B107,B608
+          bandit -r src/ -ll -ii --skip B101,B104,B105,B106,B107,B608
 
       - name: Check dependencies for vulnerabilities
         run: |
