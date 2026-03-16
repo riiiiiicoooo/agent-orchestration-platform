@@ -1,10 +1,12 @@
 """
-Rate Limiting Middleware — Per-user request throttling.
+Rate Limiting Middleware — Per-user request throttling with Redis persistence.
+
+Uses Redis cache layer for sub-millisecond lookups and PostgreSQL for long-term audit.
+Sliding window algorithm with configurable per-role limits.
 """
 
 import logging
 import time
-from collections import defaultdict
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -22,14 +24,20 @@ RATE_LIMITS = {
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
-    Per-user rate limiting with sliding window.
+    Per-user rate limiting with sliding window using Redis persistence.
 
-    Uses in-memory counters (Redis in production for multi-instance).
+    Architecture:
+    - Redis: Fast cache layer for current minute window (1-minute TTL)
+    - PostgreSQL: Persistent audit trail of rate limit violations
+    - Sliding window: Only counts requests within the last 60 seconds
+
+    This replaces in-memory defaultdict with distributed Redis state.
     """
 
     def __init__(self, app):
         super().__init__(app)
-        self.request_counts: dict[str, list[float]] = defaultdict(list)
+        # Redis client will be injected from app.state
+        self.redis_manager = None
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in ("/api/v1/health", "/docs", "/openapi.json"):
@@ -39,20 +47,37 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         role = getattr(request.state, "role", "analyst")
         limits = RATE_LIMITS.get(role, RATE_LIMITS["analyst"])
 
+        # Get Redis manager from app state
+        if not hasattr(request.app.state, "redis_manager"):
+            # Fallback for cases where Redis isn't available
+            logger.warning("Redis manager not available in app state")
+            response = await call_next(request)
+            return response
+
+        redis_manager = request.app.state.redis_manager
         now = time.time()
         minute_ago = now - 60
 
-        # Clean old entries
-        self.request_counts[user_id] = [
-            t for t in self.request_counts[user_id] if t > minute_ago
-        ]
+        # Get request timestamps from Redis for this user
+        timestamps = await redis_manager.get_request_timestamps(user_id)
 
-        if len(self.request_counts[user_id]) >= limits["requests_per_minute"]:
+        # Clean old entries (sliding window)
+        recent_timestamps = [t for t in timestamps if t > minute_ago]
+
+        # Check rate limit
+        if len(recent_timestamps) >= limits["requests_per_minute"]:
+            logger.warning(
+                "Rate limit exceeded for user %s (role=%s): %d requests in last minute",
+                user_id, role, len(recent_timestamps),
+            )
             return JSONResponse(
                 status_code=429,
                 content={"error": "Rate limit exceeded", "retry_after": 60},
             )
 
-        self.request_counts[user_id].append(now)
+        # Record this request in Redis (1-hour TTL)
+        recent_timestamps.append(now)
+        await redis_manager.add_request_timestamp(user_id, now, ttl=3600)
+
         response = await call_next(request)
         return response

@@ -99,6 +99,7 @@ class BaseAgent(ABC):
         knowledge_store: KnowledgeStore,
         tool_registry: ToolRegistry,
         config: dict[str, Any],
+        db_manager=None,
     ):
         self.agent_id = agent_id
         self.model_router = model_router
@@ -107,8 +108,9 @@ class BaseAgent(ABC):
         self.knowledge_store = knowledge_store
         self.tool_registry = tool_registry
         self.config = config
+        self.db_manager = db_manager
 
-        # Operational state
+        # Operational state (loaded from database on initialization)
         self.status = "online"
         self.tasks_completed_today = 0
         self.budget_used_today = 0.0
@@ -195,12 +197,18 @@ class BaseAgent(ABC):
                     max_tokens=self.config.get("max_tokens_per_task", 4096),
                 )
 
-            # Track metrics
+            # Track metrics (keep last 100 latencies)
             elapsed_ms = (time.monotonic() - start_time) * 1000
             self._latencies.append(elapsed_ms)
+            if len(self._latencies) > 100:
+                self._latencies = self._latencies[-100:]
             self.tasks_completed_today += 1
             self.budget_used_today += response.cost
             self.circuit_breaker.record_success()
+
+            # Persist metrics to database if available
+            if self.db_manager:
+                await self._persist_metrics()
 
             return {
                 "status": "success",
@@ -248,6 +256,56 @@ class BaseAgent(ABC):
                 })
         return results
 
+    async def _persist_metrics(self) -> None:
+        """Persist agent metrics to database."""
+        if not self.db_manager:
+            return
+
+        try:
+            from src.db import AgentMetricRecord
+            from sqlalchemy import select, update
+
+            async with self.db_manager.get_session() as session:
+                # Check if record exists
+                stmt = select(AgentMetricRecord).where(
+                    AgentMetricRecord.agent_id == self.agent_id
+                )
+                result = await session.execute(stmt)
+                record = result.scalars().first()
+
+                if record:
+                    # Update existing record
+                    stmt = update(AgentMetricRecord).where(
+                        AgentMetricRecord.agent_id == self.agent_id
+                    ).values(
+                        latencies=self._latencies[-100:],
+                        tasks_completed_today=self.tasks_completed_today,
+                        budget_used_today=self.budget_used_today,
+                        errors_today=self._errors_today,
+                        circuit_breaker_state=self.circuit_breaker.state,
+                        circuit_breaker_failure_count=self.circuit_breaker.failure_count,
+                        circuit_breaker_last_failure=self.circuit_breaker.last_failure_time,
+                    )
+                    await session.execute(stmt)
+                else:
+                    # Create new record
+                    record = AgentMetricRecord(
+                        agent_id=self.agent_id,
+                        latencies=self._latencies[-100:],
+                        tasks_completed_today=self.tasks_completed_today,
+                        budget_used_today=self.budget_used_today,
+                        errors_today=self._errors_today,
+                        circuit_breaker_state=self.circuit_breaker.state,
+                        circuit_breaker_failure_count=self.circuit_breaker.failure_count,
+                        circuit_breaker_last_failure=self.circuit_breaker.last_failure_time,
+                    )
+                    session.add(record)
+
+                await session.commit()
+        except Exception as e:
+            logger.error("Failed to persist agent metrics: %s", str(e))
+
     async def shutdown(self) -> None:
-        """Graceful shutdown."""
+        """Graceful shutdown — persist final metrics."""
+        await self._persist_metrics()
         self.status = "offline"

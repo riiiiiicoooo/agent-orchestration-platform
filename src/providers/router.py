@@ -51,10 +51,12 @@ class ModelRouter:
         primary_provider: str = "anthropic",
         fallback_provider: str = "openai",
         routing_provider: str = "anthropic",
+        redis_manager=None,
     ):
         self.primary_provider = primary_provider
         self.fallback_provider = fallback_provider
         self.routing_provider = routing_provider
+        self.redis_manager = redis_manager
 
         # Initialize providers
         self.providers: dict[str, BaseLLMProvider] = {
@@ -62,7 +64,7 @@ class ModelRouter:
             "openai": OpenAIProvider(),
         }
 
-        # Cost tracking
+        # In-memory cache for cost tracking (synced to Redis)
         self.total_cost = 0.0
         self.cost_by_model: dict[str, float] = {}
         self.cost_by_provider: dict[str, float] = {}
@@ -98,7 +100,7 @@ class ModelRouter:
             )
 
             # Track costs
-            self._track_cost(model, provider_name, response.cost)
+            await self._track_cost(model, provider_name, response.cost)
             return response
 
         except Exception as e:
@@ -120,7 +122,7 @@ class ModelRouter:
                         max_tokens=max_tokens,
                         temperature=temperature,
                     )
-                    self._track_cost(failover_model, failover_provider_name, response.cost)
+                    await self._track_cost(failover_model, failover_provider_name, response.cost)
                     return response
 
             raise
@@ -146,13 +148,22 @@ class ModelRouter:
             temperature=0.0,
         )
 
-        self._track_cost("claude-3-haiku", self.routing_provider, response.cost)
+        await self._track_cost("claude-3-haiku", self.routing_provider, response.cost)
         return response.content
 
-    def _track_cost(self, model: str, provider: str, cost: float) -> None:
+    async def _track_cost(self, model: str, provider: str, cost: float) -> None:
+        """Track cost in both in-memory cache and Redis."""
         self.total_cost += cost
         self.cost_by_model[model] = self.cost_by_model.get(model, 0.0) + cost
         self.cost_by_provider[provider] = self.cost_by_provider.get(provider, 0.0) + cost
+
+        # Persist to Redis for distributed access
+        if self.redis_manager:
+            await self.redis_manager.increment_cost(
+                model=model,
+                provider=provider,
+                cost=cost,
+            )
 
     def get_cost_summary(self) -> dict[str, Any]:
         return {

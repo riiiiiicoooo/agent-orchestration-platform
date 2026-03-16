@@ -2,13 +2,13 @@
 API Routes — FastAPI endpoint definitions for the orchestration platform.
 
 Provides REST API for task submission, agent management, cost tracking,
-and system health monitoring.
+and system health monitoring. All list endpoints include pagination.
 """
 
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi import APIRouter, Depends, Request, HTTPException, Query
 from src.api.models import (
     TaskRequest,
     TaskResponse,
@@ -16,6 +16,7 @@ from src.api.models import (
     CostSummaryResponse,
     HealthResponse,
 )
+from src.db import PaginationParams
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -114,3 +115,81 @@ async def get_knowledge_stats(request: Request, domain: str) -> dict[str, Any]:
     """Get statistics for a knowledge domain."""
     knowledge_store = request.app.state.knowledge_store
     return await knowledge_store.get_domain_stats(domain)
+
+
+@router.get("/cost/history")
+async def get_cost_history(
+    request: Request,
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(20, ge=1, le=100, description="Number of records to return"),
+) -> dict[str, Any]:
+    """
+    Get paginated cost history with model and provider breakdown.
+
+    Pagination:
+    - skip: Number of records to skip (default: 0)
+    - limit: Max records per page (default: 20, max: 100)
+    """
+    db_manager = request.app.state.db_manager
+
+    try:
+        from sqlalchemy import select
+        from src.db import CostRecord
+
+        async with db_manager.get_session() as session:
+            # Get total count
+            stmt = select(CostRecord).order_by(CostRecord.created_at.desc())
+            result = await session.execute(stmt)
+            records = result.scalars().all()
+            total = len(records)
+
+            # Apply pagination
+            paginated = records[skip:skip + limit]
+
+            return {
+                "total": total,
+                "skip": skip,
+                "limit": limit,
+                "records": [
+                    {
+                        "model": r.model_name,
+                        "provider": r.provider_name,
+                        "cost": r.cost,
+                        "tokens": r.tokens,
+                        "created_at": r.created_at.isoformat(),
+                    }
+                    for r in paginated
+                ],
+            }
+    except Exception as e:
+        logger.error("Failed to fetch cost history: %s", str(e))
+        return {"total": 0, "skip": skip, "limit": limit, "records": []}
+
+
+@router.get("/rate-limits/{user_id}")
+async def get_user_rate_limit_status(
+    request: Request,
+    user_id: str,
+) -> dict[str, Any]:
+    """Get current rate limit status for a user."""
+    redis_manager = request.app.state.redis_manager
+
+    try:
+        timestamps = await redis_manager.get_request_timestamps(user_id)
+        import time
+        now = time.time()
+        minute_ago = now - 60
+
+        recent = [t for t in timestamps if t > minute_ago]
+        return {
+            "user_id": user_id,
+            "requests_in_last_minute": len(recent),
+            "total_tracked_requests": len(timestamps),
+        }
+    except Exception as e:
+        logger.error("Failed to fetch rate limit status: %s", str(e))
+        return {
+            "user_id": user_id,
+            "requests_in_last_minute": 0,
+            "total_tracked_requests": 0,
+        }

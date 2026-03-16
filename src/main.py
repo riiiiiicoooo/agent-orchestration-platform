@@ -24,6 +24,7 @@ from src.memory.conversation import ConversationStore
 from src.memory.knowledge import KnowledgeStore
 from src.orchestrator.supervisor import SupervisorAgent
 from src.providers.router import ModelRouter
+from src.db import DatabaseManager, RedisManager
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,16 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize and teardown shared resources."""
     logger.info("Starting Agent Orchestration Platform...")
+
+    # Initialize database with QueuePool connection pooling
+    db_manager = DatabaseManager(database_url=settings.DATABASE_URL)
+    await db_manager.initialize()
+    app.state.db_manager = db_manager
+
+    # Initialize Redis for cache layer (rate limits, cost tracking)
+    redis_manager = RedisManager(redis_url=settings.REDIS_URL)
+    await redis_manager.initialize()
+    app.state.redis_manager = redis_manager
 
     # Initialize memory stores
     app.state.session_store = RedisSessionStore(
@@ -46,11 +57,12 @@ async def lifespan(app: FastAPI):
         embedding_model=settings.EMBEDDING_MODEL,
     )
 
-    # Initialize model router (multi-provider LLM abstraction)
+    # Initialize model router with Redis cost tracking
     app.state.model_router = ModelRouter(
         primary_provider="anthropic",
         fallback_provider="openai",
         routing_provider="anthropic",  # Haiku for fast classification
+        redis_manager=redis_manager,
     )
 
     # Initialize supervisor agent
@@ -59,6 +71,7 @@ async def lifespan(app: FastAPI):
         session_store=app.state.session_store,
         conversation_store=app.state.conversation_store,
         knowledge_store=app.state.knowledge_store,
+        db_manager=db_manager,
     )
 
     await app.state.session_store.connect()
@@ -75,6 +88,8 @@ async def lifespan(app: FastAPI):
     # Teardown
     await app.state.session_store.disconnect()
     await app.state.supervisor.shutdown()
+    await redis_manager.close()
+    await db_manager.close()
     logger.info("Agent Orchestration Platform stopped.")
 
 

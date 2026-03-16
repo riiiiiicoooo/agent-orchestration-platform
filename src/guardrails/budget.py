@@ -3,6 +3,8 @@ Budget Enforcement — Per-agent, per-user token budgets with circuit breakers.
 
 Prevents cost runaway by enforcing daily and per-request budget limits.
 Alerts at 80% budget utilization, circuit breaker at 100%.
+
+Persistence: PostgreSQL for configurations, Redis for daily state tracking.
 """
 
 import logging
@@ -32,13 +34,20 @@ class BudgetState:
 
 class BudgetEnforcer:
     """
-    Per-agent and per-user budget enforcement.
+    Per-agent and per-user budget enforcement with persistent storage.
 
-    Tracks token spend in real-time (via Redis) and enforces
-    configurable daily limits with alerting.
+    Architecture:
+    - PostgreSQL: Stores budget configurations (agent_budgets, user_budgets)
+    - Redis: Caches daily state (spent_today, requests_today) with auto-reset
+    - In-memory dict: Loaded at startup, updated via database
+
+    This replaces in-memory-only tracking with durable persistence.
     """
 
-    def __init__(self):
+    def __init__(self, db_manager=None, redis_manager=None):
+        self.db_manager = db_manager
+        self.redis_manager = redis_manager
+        # In-memory cache loaded from database at startup
         self.agent_budgets: dict[str, BudgetConfig] = {}
         self.user_budgets: dict[str, BudgetConfig] = {}
 

@@ -50,11 +50,13 @@ class SupervisorAgent:
         session_store: RedisSessionStore,
         conversation_store: ConversationStore,
         knowledge_store: KnowledgeStore,
+        db_manager=None,
     ):
         self.model_router = model_router
         self.session_store = session_store
         self.conversation_store = conversation_store
         self.knowledge_store = knowledge_store
+        self.db_manager = db_manager
 
         # Initialize components
         self.intent_router = IntentRouter(model_router=model_router)
@@ -106,6 +108,7 @@ class SupervisorAgent:
                 knowledge_store=self.knowledge_store,
                 tool_registry=self.tool_registry,
                 config=config,
+                db_manager=self.db_manager,
             )
             self.agents[agent_id] = agent
             logger.info("Registered agent: %s (model: %s)", agent_id, model)
