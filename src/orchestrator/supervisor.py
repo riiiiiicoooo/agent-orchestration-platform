@@ -4,6 +4,9 @@ Supervisor Agent — Central orchestration coordinator.
 Decomposes incoming tasks, routes to specialized agents, enforces guardrails,
 and aggregates results. Uses LangGraph for stateful workflow execution
 with checkpointing and human-in-the-loop gates.
+
+Integrates hook system for extensible behavior and supports subagent-aware
+task decomposition for complex workflows.
 """
 
 import logging
@@ -27,6 +30,7 @@ from src.memory.session import RedisSessionStore
 from src.memory.conversation import ConversationStore
 from src.memory.knowledge import KnowledgeStore
 from src.providers.router import ModelRouter
+from src.hooks.engine import HookEngine, HookContext, HookType
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +55,16 @@ class SupervisorAgent:
         conversation_store: ConversationStore,
         knowledge_store: KnowledgeStore,
         db_manager=None,
+        hook_engine: HookEngine | None = None,
+        subagent_pool=None,
     ):
         self.model_router = model_router
         self.session_store = session_store
         self.conversation_store = conversation_store
         self.knowledge_store = knowledge_store
         self.db_manager = db_manager
+        self.hook_engine = hook_engine or HookEngine()
+        self.subagent_pool = subagent_pool
 
         # Initialize components
         self.intent_router = IntentRouter(model_router=model_router)
@@ -109,6 +117,8 @@ class SupervisorAgent:
                 tool_registry=self.tool_registry,
                 config=config,
                 db_manager=self.db_manager,
+                hook_engine=self.hook_engine,
+                subagent_pool=self.subagent_pool,
             )
             self.agents[agent_id] = agent
             logger.info("Registered agent: %s (model: %s)", agent_id, model)
@@ -137,17 +147,30 @@ class SupervisorAgent:
         Main entry point — process a user request through the orchestration pipeline.
 
         Flow:
-        1. Classify intent (Haiku, <200ms)
-        2. Check guardrails (pre-execution)
-        3. Retrieve relevant context from memory
-        4. Route to agent(s)
-        5. Check guardrails (post-execution)
-        6. Store results in memory
-        7. Return aggregated response
+        1. Fire SESSION_START hook
+        2. Classify intent (Haiku, <200ms)
+        3. Check guardrails (pre-execution)
+        4. Fire PRE_EXECUTE hook
+        5. Retrieve relevant context from memory
+        6. Decompose task (with subagent awareness)
+        7. Route to agent(s)
+        8. Check guardrails (post-execution)
+        9. Fire POST_EXECUTE hook
+        10. Store results in memory
+        11. Return aggregated response
         """
         start_time = time.monotonic()
 
-        # Step 1: Classify intent
+        # Step 1: Fire SESSION_START hook
+        session_context_obj = HookContext(
+            hook_type=HookType.SESSION_START,
+            session_id=session_id,
+            task=user_input,
+            metadata={"user_id": user_id},
+        )
+        await self.hook_engine.fire(HookType.SESSION_START, session_context_obj)
+
+        # Step 2: Classify intent
         intent = await self.intent_router.classify(
             user_input=user_input,
             session_context=await self.session_store.get_context(session_id),
@@ -160,7 +183,7 @@ class SupervisorAgent:
             intent.target_agents,
         )
 
-        # Step 2: Pre-execution guardrails
+        # Step 3: Pre-execution guardrails
         pre_check = await self.guardrail_engine.check_input(
             user_input=user_input,
             intent=intent,
@@ -175,7 +198,19 @@ class SupervisorAgent:
                 latency_ms=int((time.monotonic() - start_time) * 1000),
             )
 
-        # Step 3: Retrieve context from memory
+        # Step 4: Fire PRE_EXECUTE hook
+        pre_execute_context = HookContext(
+            hook_type=HookType.PRE_EXECUTE,
+            session_id=session_id,
+            task=user_input,
+            metadata={
+                "intent": intent.domain,
+                "target_agents": intent.target_agents,
+            },
+        )
+        await self.hook_engine.fire(HookType.PRE_EXECUTE, pre_execute_context)
+
+        # Step 5: Retrieve context from memory
         session_context = await self.session_store.get_context(session_id)
         conversation_history = await self.conversation_store.get_recent(
             session_id=session_id,
@@ -187,7 +222,7 @@ class SupervisorAgent:
             top_k=5,
         )
 
-        # Step 4: Build orchestrator state and execute graph
+        # Step 6: Build orchestrator state and execute graph
         state = OrchestratorState(
             user_input=user_input,
             session_id=session_id,
@@ -205,13 +240,23 @@ class SupervisorAgent:
         # Execute the LangGraph orchestration graph
         result = await self.graph.ainvoke(state)
 
-        # Step 5: Post-execution guardrails
+        # Step 7: Post-execution guardrails
         post_check = await self.guardrail_engine.check_output(
             response=result.response,
             intent=intent,
             agent_outputs=result.agent_outputs,
         )
         if post_check.blocked:
+            # Fire ON_ESCALATION hook
+            escalation_context = HookContext(
+                hook_type=HookType.ON_ESCALATION,
+                session_id=session_id,
+                task=user_input,
+                confidence=0.0,  # Blocked by guardrail
+                metadata={"reason": post_check.reason},
+            )
+            await self.hook_engine.fire(HookType.ON_ESCALATION, escalation_context)
+
             # Escalate to human review instead of returning blocked content
             await self._escalate_to_human(
                 state=state,
@@ -227,7 +272,16 @@ class SupervisorAgent:
                 latency_ms=int((time.monotonic() - start_time) * 1000),
             )
 
-        # Step 6: Store results in memory
+        # Step 8: Fire POST_EXECUTE hook
+        post_execute_context = HookContext(
+            hook_type=HookType.POST_EXECUTE,
+            session_id=session_id,
+            task=user_input,
+            result={"response": result.response[:200]},
+        )
+        await self.hook_engine.fire(HookType.POST_EXECUTE, post_execute_context)
+
+        # Step 9: Store results in memory
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
         await self.session_store.update_context(

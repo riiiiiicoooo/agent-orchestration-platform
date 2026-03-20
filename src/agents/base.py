@@ -3,6 +3,8 @@ Base Agent — Common interface for all specialized agents.
 
 Provides circuit breaker, cost tracking, tool access, and
 standardized execution flow that all domain agents inherit.
+Integrates with hook system for extensible behavior and supports
+subagent spawning for task decomposition.
 """
 
 import logging
@@ -16,6 +18,7 @@ from src.providers.router import ModelRouter
 from src.memory.session import RedisSessionStore
 from src.memory.knowledge import KnowledgeStore
 from src.tools.registry import ToolRegistry
+from src.hooks.engine import HookEngine, HookContext, HookType
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,8 @@ class BaseAgent(ABC):
         tool_registry: ToolRegistry,
         config: dict[str, Any],
         db_manager=None,
+        hook_engine: HookEngine | None = None,
+        subagent_pool=None,
     ):
         self.agent_id = agent_id
         self.model_router = model_router
@@ -109,6 +114,8 @@ class BaseAgent(ABC):
         self.tool_registry = tool_registry
         self.config = config
         self.db_manager = db_manager
+        self.hook_engine = hook_engine or HookEngine()
+        self.subagent_pool = subagent_pool
 
         # Operational state (loaded from database on initialization)
         self.status = "online"
@@ -117,6 +124,9 @@ class BaseAgent(ABC):
         self._latencies: list[float] = []
         self._errors_today = 0
         self.circuit_breaker = CircuitBreaker()
+
+        # Subagent capability flag
+        self.can_spawn_subagents: bool = config.get("can_spawn_subagents", False)
 
     @property
     def circuit_breaker_state(self) -> str:
@@ -140,20 +150,37 @@ class BaseAgent(ABC):
         self,
         task: str,
         context: dict[str, Any],
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Execute a task with full instrumentation.
 
         Flow:
-        1. Check circuit breaker
-        2. Check budget
-        3. Build prompt with context
-        4. Call LLM via model router
-        5. Process tool calls (if any)
-        6. Track cost and latency
-        7. Return structured result
+        1. Fire PRE_EXECUTE hooks
+        2. Check circuit breaker
+        3. Check budget
+        4. Build prompt with context
+        5. Call LLM via model router
+        6. Process tool calls (if any)
+        7. Fire POST_EXECUTE hooks
+        8. Track cost and latency
+        9. Return structured result
         """
         start_time = time.monotonic()
+
+        # Fire PRE_EXECUTE hooks
+        if session_id:
+            pre_context = HookContext(
+                hook_type=HookType.PRE_EXECUTE,
+                session_id=session_id,
+                agent_id=self.agent_id,
+                task=task,
+                metadata={
+                    "budget_limit": self.config["budget_limit_daily"],
+                    "budget_used": self.budget_used_today,
+                },
+            )
+            await self.hook_engine.fire(HookType.PRE_EXECUTE, pre_context)
 
         # Circuit breaker check
         if not self.circuit_breaker.can_execute():
@@ -188,7 +215,10 @@ class BaseAgent(ABC):
 
             # Process any tool calls
             if response.tool_calls:
-                tool_results = await self._execute_tools(response.tool_calls)
+                tool_results = await self._execute_tools(
+                    response.tool_calls,
+                    session_id=session_id,
+                )
                 # Follow-up call with tool results
                 response = await self.model_router.generate(
                     model=self.model_name,
@@ -205,6 +235,17 @@ class BaseAgent(ABC):
             self.tasks_completed_today += 1
             self.budget_used_today += response.cost
             self.circuit_breaker.record_success()
+
+            # Fire POST_EXECUTE hooks
+            if session_id:
+                post_context = HookContext(
+                    hook_type=HookType.POST_EXECUTE,
+                    session_id=session_id,
+                    agent_id=self.agent_id,
+                    task=task,
+                    result={"content": response.content, "tokens": response.total_tokens},
+                )
+                await self.hook_engine.fire(HookType.POST_EXECUTE, post_context)
 
             # Persist metrics to database if available
             if self.db_manager:
@@ -225,6 +266,17 @@ class BaseAgent(ABC):
             self.circuit_breaker.record_failure()
             elapsed_ms = (time.monotonic() - start_time) * 1000
 
+            # Fire ON_ERROR hooks
+            if session_id:
+                error_context = HookContext(
+                    hook_type=HookType.ON_ERROR,
+                    session_id=session_id,
+                    agent_id=self.agent_id,
+                    task=task,
+                    error=e,
+                )
+                await self.hook_engine.fire(HookType.ON_ERROR, error_context)
+
             logger.error(
                 "Agent %s failed: %s (latency: %.0fms)",
                 self.agent_id, str(e), elapsed_ms,
@@ -243,18 +295,67 @@ class BaseAgent(ABC):
         """Build domain-specific prompt. Implemented by each specialized agent."""
         ...
 
-    async def _execute_tools(self, tool_calls: list[dict]) -> list[dict]:
+    async def _execute_tools(
+        self,
+        tool_calls: list[dict],
+        session_id: str | None = None,
+    ) -> list[dict]:
         """Execute tool calls and return results."""
         results = []
         for call in tool_calls:
             tool = self.tool_registry.get_tool(call["name"])
             if tool:
+                # Fire ON_TOOL_CALL hook
+                if session_id:
+                    tool_context = HookContext(
+                        hook_type=HookType.ON_TOOL_CALL,
+                        session_id=session_id,
+                        agent_id=self.agent_id,
+                        tool_name=call["name"],
+                        tool_args=call.get("arguments", {}),
+                    )
+                    await self.hook_engine.fire(HookType.ON_TOOL_CALL, tool_context)
+
                 result = await tool.execute(**call["arguments"])
                 results.append({
                     "tool_call_id": call["id"],
                     "output": result,
                 })
         return results
+
+    async def spawn_subagent(
+        self,
+        config: "SubagentConfig",
+        task: str,
+    ) -> "SubagentResult":
+        """
+        Spawn a lightweight subagent to execute a subtask.
+
+        Only available if can_spawn_subagents is True in config.
+
+        Args:
+            config: Subagent configuration
+            task: Task description for the subagent
+
+        Returns:
+            SubagentResult with output and metadata
+        """
+        if not self.can_spawn_subagents or not self.subagent_pool:
+            raise RuntimeError(
+                f"Agent {self.agent_id} does not support subagent spawning"
+            )
+
+        # Cost rolls up to parent's budget
+        result = await self.subagent_pool.spawn(
+            parent_agent_id=self.agent_id,
+            config=config,
+            task=task,
+        )
+
+        # Track cost against parent's budget
+        self.budget_used_today += result.cost
+
+        return result
 
     async def _persist_metrics(self) -> None:
         """Persist agent metrics to database."""
